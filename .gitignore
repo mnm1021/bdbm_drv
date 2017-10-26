@@ -1,0 +1,8 @@
+# ignore tags and cscope files
+/tags
+/TAGS
+cscope.*
+ncscope.*
+
+# include gitignore
+!.gitignore

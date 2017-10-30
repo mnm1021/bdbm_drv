@@ -38,6 +38,8 @@ bdbm_dm_inf_t _bdbm_dm_inf = {
 	.store = dm_ocssd_store,
 };
 
+extern bdbm_drv_info_t* _bdi_dm;
+
 /* NVMe device command */
 typedef struct {
 	__u8	opcode;
@@ -54,6 +56,158 @@ typedef struct {
 	__le32	dsmgmt;
 	__le64	slba;
 } bdbm_nvme_command;
+
+/**
+ * convert BlueDBM's low-level request into NVMe command.
+ *
+ * @param req (bdbm_llm_req_t *):	low-level request.
+ * @param dev (struct nvm_dev *):	target device.
+ * @param cmd (bdbm_nvme_cmd *):	(output) NVMe command.
+ */
+static void dm_nvm_rqtocmd (bdbm_llm_req_t* req,
+		struct nvm_dev* dev,
+		bdbm_nvme_command* cmd)
+{
+	int flags = 0;
+	struct nvme_ns *ns = dev->q->queuedata;
+	struct nvm_geo *geo = *dev->geo;
+	struct ppa_addr ppa;
+	dma_addr_t dma_meta_list;
+	bdbm_phyaddr_t phyaddr = req->phyaddr;
+
+	/* set physical address */
+	ppa.ppa = ((u64)req->block_no) << geo->ppaf.blk_offset;
+	ppa.ppa |= ((u64)req->page_no) << geo->ppaf.pg_offset;
+	ppa.ppa |= ((u64)0) << geo->ppaf.sect_offset;
+	ppa.ppa |= ((u64)req->chip_no) << geo->ppaf.pln_offset;
+	ppa.ppa |= ((u64)req->punit_id) << geo->ppaf.lun_offset;
+	ppa.ppa |= ((u64)req->channel_no) << geo->ppaf.ch_offset;
+
+	/* set dma_meta_list */
+	dev->ops->dev_dma_alloc(dev, dev->dma_pool, GFP_KERNEL, &dma_meta_list);
+
+	/* TODO figure out GC R/W has any flags */
+	switch(req->req_type)
+	{
+		/* write operation */
+		case REQTYPE_WRITE:
+		case REQTYPE_GC_WRITE:
+		case REQTYPE_RMW_WRITE:
+		case REQTYPE_META_WRITE:
+			cmd->opcode = NVM_OP_PWRITE;
+			flags = dev->geo.plane_mode >> 1;
+			flags |= NVM_IO_SCRAMBLE_ENABLE;
+			break;
+
+		/* read operation */
+		case REQTYPE_READ:
+		case REQTYPE_GC_READ:
+		case REQTYPE_RMW_READ:
+		case REQTYPE_META_READ:
+		case REQTYPE_READ_DUMMY:
+			cmd->opcode = NVM_OP_PREAD;
+			flags = NVM_IO_SUSPEND | NVM_IO_SCRAMBLE_ENABLE;
+			break;
+
+		/* erase operation for gc */
+		case REQTYPE_GC_ERASE:
+			cmd.opcode = NVM_OP_ERASE;
+			flags = dev->geo.plane_mode >> 1;
+			break;
+
+		/* undefined request type */
+		default:
+			return;
+	}
+
+	cmd->nsid = cpu_to_le32(ns->ns_id);
+	cmd->spba = cpu_to_le64(ppa.ppa);
+	cmd->metadata = cpu_to_le64(dma_meta_list);
+	cmd->control = cpu_to_le16(flags);
+	cmd->length = cpu_to_le16(3); /* nr_ppas-1 : low level request is 16K, sector is 4K */
+}
+
+/**
+ * NVMe request allocation.
+ * this code is from {KERNEL_ROOT}/drivers/nvme/host/core.c.
+ */
+static struct request* dm_nvme_alloc_request(struct request_queue *q,
+		struct nvme_command *cmd,
+		unsigned int flags,
+		int qid)
+{
+	unsigned op = nvme_is_write(cmd) ? REQ_OP_DRV_OUT : REQ_OP_DRV_IN;
+	struct request *req;
+
+	if (qid == NVME_QID_ANY) {
+		req = blk_mq_alloc_request(q, op, flags);
+	} else {
+		req = blk_mq_alloc_request_hctx(q, op, flags, qid ? qid - 1 : 0);
+	}
+
+	if (IS_ERR(req))
+		return req;
+
+	req->cmd_flags |= REQ_FAILFAST_DRIVER;
+	nvme_req(req)->cmd = cmd;
+
+	return req;
+}
+
+/**
+ * callback function for I/O.
+ */
+static void dm_nvm_end_io (struct request *rq, blk_status_t status)
+{
+	bdbm_llm_req_t* req = rq->end_io_data;
+	
+	_bdbm_dm_inf.end_req(_bdi_dm, req);
+
+	kfree(nvme_req(rq)->cmd);
+	blk_mq_free_request(rq);
+}
+
+/**
+ * submit low-level I/O request to target device.
+ *
+ * @param dev (struct nvm_dev *):	target device.
+ * @param req (bdbm_llm_req_t *):	low-level request.
+ */
+static uint32_t dm_nvm_submit_io (struct nvm_dev* dev, bdbm_llm_req_t* req)
+{
+	struct request_queue* q = dev->q;
+	struct request* rq;
+	bdbm_nvme_command* cmd;
+
+	/* create NVMe command */
+	cmd = kzalloc(sizeof(bdbm_nvme_command), GFP_KERNEL);
+	if(!cmd)
+		return -ENOMEM;
+	dm_nvm_rqtocmd(req, q->queuedata, cmd);
+
+	/* request initialization */
+	rq = dm_nvme_alloc_request(q, (struct nvme_command *)cmd, 0, NVME_QID_ANY);
+	if(IS_ERR(rq))
+		return rq;
+
+	rq->cmd_flags &= ~REQ_FAILFAST_DRIVER;
+
+	if(rqd->bio) {
+		blk_init_request_from_bio(rq, (struct bio *)req->ptr_hlm_req->blkio_req->bio);
+	}
+	else {
+		rq->ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, IOPRIO_NORM);
+		rq->__data_len = 0;
+	}
+
+	/* submit I/O with data for callback */
+	rq->end_io_data = req;
+	blk_execute_rq_nowait(q, NULL, rq, 0, dm_nvm_end_io);
+
+	return 0;
+}
+
+/* device management functions */
 
 /**
  * Initializes and finds the NVMe Device from kernel.
@@ -104,9 +258,7 @@ uint32_t dm_ocssd_close (bdbm_drv_info_t* bdi)
  */
 uint32_t dm_ocssd_make_req (bdbm_drv_info_t* bdi, bdbm_llm_req_t* ptr_llm_req)
 {
-	/* TODO make request for low-level request. */
-	/* setting rq->private(?) data to ptr_llm_req would help for callback. */
-	return -1;
+	return dm_nvm_submit_io(/* struct nvm_dev* */, ptr_llm_req);
 }
 
 /**
@@ -118,40 +270,20 @@ uint32_t dm_ocssd_make_req (bdbm_drv_info_t* bdi, bdbm_llm_req_t* ptr_llm_req)
  */
 uint32_t dm_ocssd_make_reqs (bdbm_drv_info_t* bdi, bdbm_hlm_req_t* hr)
 {
-	/* TODO to make these work below,
-	   new callback for bdbm_hlm_req_t should be defined. */
-	bdbm_nvme_command cmd;
-	struct request* rq = NULL;
-	struct bio* bio = hr->blkio_req->bio;
+#include "../../ftl/hlm_reqs_pool.h"
 
-	switch(hr->req_type)
-	{
-		/* write operation */
-		case REQTYPE_WRITE:
-		case REQTYPE_GC_WRITE:
-		case REQTYPE_RMW_WRITE:
-		case REQTYPE_META_WRITE:
-			//cmd.opcode = NVM_OP_PWRITE;
+	uint32_t i, ret = 1;
+	bdbm_llm_req_t* lr = NULL;
+	dm_ramssd_private_t* p = BDBM_DM_PRIV (bdi);
+
+	bdbm_hlm_for_each_llm_req (lr, hr, i) {
+		if ((ret = dm_nvm_submit_io (/* struct nvm_dev* */, lr)) != 0) {
+			bdbm_error ("nvm_submit_io failed");
 			break;
-
-		/* read operation */
-		case REQTYPE_READ:
-		case REQTYPE_GC_READ:
-		case REQTYPE_RMW_READ:
-		case REQTYPE_META_READ:
-		case REQTYPE_READ_DUMMY:
-			//cmd.opcode = NVM_OP_PREAD;
-			break;
-
-		/* erase operation for gc */
-		case REQTYPE_GC_ERASE:
-			//cmd.opcode = NVM_OP_ERASE;
-			break;
-
-		/* undefined request type */
-		default:
-			return -1;
+		}
 	}
+
+	return ret;
 }
 
 /**
@@ -177,10 +309,6 @@ uint32_t dm_ocssd_store (bdbm_drv_info_t* bdi, const char* fn)
 {
 	return -1;
 }
-
-
-
-
 
 
 
